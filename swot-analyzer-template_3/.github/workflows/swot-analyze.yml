@@ -1,0 +1,160 @@
+# .github/workflows/swot-analyze.yml
+#
+# Автоматический SWOT-анализ:
+# 1. Анализирует файлы при пуше
+# 2. Коммитит результаты обратно в репо
+# 3. Деплоит красивую визуализацию на GitHub Pages
+
+name: 🎯 SWOT Analysis
+
+on:
+  push:
+    paths:
+      - 'analysis/*.md'
+      - 'context.md'
+    branches:
+      - main
+  
+  workflow_dispatch:
+    inputs:
+      source_file:
+        description: 'Файл для анализа'
+        required: true
+        default: 'analysis/company.md'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+
+jobs:
+  analyze:
+    name: 📊 SWOT Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 📦 Install Python dependencies
+        run: |
+          pip install anthropic langchain langchain-anthropic numpy
+          pip install sentence-transformers || echo "⚠️ Эмбеддинги недоступны"
+
+      - name: 🔍 Find source file
+        id: source
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            FILE="${{ github.event.inputs.source_file }}"
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'analysis/*.md' 2>/dev/null | head -1)
+            FILE="${CHANGED:-analysis/company.md}"
+          fi
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "📄 Анализируем: $FILE"
+
+      - name: 🎯 Run SWOT Analyzer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python swot_analyzer.py "${{ steps.source.outputs.file }}" \
+            --context context.md \
+            --db swot.db \
+            --outputs outputs
+
+      - name: 💾 Commit results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add outputs/ swot.db
+          
+          if git diff --staged --quiet; then
+            echo "📭 Нет изменений для коммита"
+          else
+            git commit -m "🎯 SWOT Analysis: $(date +'%Y-%m-%d %H:%M')"
+            git push
+            echo "✅ Результаты закоммичены"
+          fi
+
+      - name: 📤 Upload DB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swot-database
+          path: swot.db
+          retention-days: 90
+
+  deploy-docs:
+    name: 🚀 Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: analyze
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📥 Download database from analyze job
+        uses: actions/download-artifact@v4
+        with:
+          name: swot-database
+          path: .
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📦 Install dependencies
+        working-directory: swot-docs
+        run: npm install
+
+      - name: 🔄 Generate MDX from database
+        working-directory: swot-docs
+        run: |
+          if [ -f "../swot.db" ]; then
+            npm run generate -- --db ../swot.db
+            echo "✅ MDX сгенерирован"
+          else
+            echo "⚠️ База данных не найдена, используем плейсхолдеры"
+          fi
+
+      - name: 🏗️ Build Docusaurus
+        working-directory: swot-docs
+        env:
+          DOCUSAURUS_URL: https://${{ github.repository_owner }}.github.io
+          DOCUSAURUS_BASE_URL: /${{ github.event.repository.name }}/
+        run: npm run build
+
+      - name: 📄 Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: 📤 Upload to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: swot-docs/build
+
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: ✅ Done
+        run: |
+          echo "🎉 Готово!"
+          echo "📊 SWOT: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
